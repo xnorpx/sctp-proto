@@ -10,14 +10,14 @@ use std::{
     time::Instant,
 };
 
-use crate::association::Association;
-use crate::chunk::chunk_type::CT_INIT;
+use crate::chunk::{chunk_init::ChunkInit, chunk_type::CT_INIT};
 use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
 use crate::packet::PartialDecode;
 use crate::shared::{
     AssociationEvent, AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner,
 };
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
+use crate::{association::Association, chunk::Chunk};
 use crate::{EcnCodepoint, Payload, Transmit};
 
 use bytes::Bytes;
@@ -149,7 +149,7 @@ impl Endpoint {
             //TODO: improve INIT handling for DoS attack
             if partial_decode.first_chunk_type == CT_INIT {
                 if let Some(dst_cid) = partial_decode.initiate_tag {
-                    self.association_ids.get(&dst_cid).cloned()
+                    self.association_ids_init.get(&dst_cid).cloned()
                 } else {
                     None
                 }
@@ -181,10 +181,15 @@ impl Endpoint {
     }
 
     /// Initiate an Association
+    ///
+    /// If `config.out_of_band_init` is set, this will create an association that can
+    /// skip the SCTP 4-way handshake. Otherwise, a normal association handshake will
+    /// be performed.
     pub fn connect(
         &mut self,
         config: ClientConfig,
         remote: SocketAddr,
+        now: Instant,
     ) -> Result<(AssociationHandle, Association), ConnectError> {
         if self.is_full() {
             return Err(ConnectError::TooManyAssociations);
@@ -193,18 +198,91 @@ impl Endpoint {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
 
-        let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
-        let local_aid = self.new_aid();
+        if config.remote_chunk_init.is_none() {
+            let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
+            let local_aid = self.new_aid();
 
-        let (ch, conn) = self.add_association(
-            remote_aid,
-            local_aid,
+            Ok(self.add_association(
+                remote_aid,
+                local_aid,
+                remote,
+                None,
+                now,
+                None,
+                config.transport,
+            ))
+        } else {
+            // Use out-of-band INIT chunks to create the association
+            self.connect_with_remote_chunk_init(config, remote)
+        }
+    }
+
+    /// Create an association using out-of-band INIT chunks.
+    fn connect_with_remote_chunk_init(
+        &mut self,
+        client_config: ClientConfig,
+        remote: SocketAddr,
+    ) -> Result<(AssociationHandle, Association), ConnectError> {
+        // Parse the local and remote INIT chunks
+        let local_init = client_config.transport.chunk_init();
+        let Some(ref remote_marshalled_chunk_init) = client_config.remote_chunk_init else {
+            return Err(ConnectError::OutOfBandInitError(
+                "No remote INIT chunk provided".to_string(),
+            ));
+        };
+        let remote_init = ChunkInit::unmarshal(remote_marshalled_chunk_init).map_err(|err| {
+            ConnectError::OutOfBandInitError(format!("Failed to parse remote INIT: {err}"))
+        })?;
+
+        if remote_init.is_ack {
+            return Err(ConnectError::OutOfBandInitError(
+                "Invalid out-of-band remote chunk: expected INIT, got INIT-ACK".to_string(),
+            ));
+        }
+
+        let local_aid = local_init.initiate_tag;
+        let remote_aid = remote_init.initiate_tag;
+        if remote_aid == 0 {
+            return Err(ConnectError::OutOfBandInitError(
+                "Remote INIT has zero initiate_tag".to_string(),
+            ));
+        }
+
+        let conn = Association::new_with_out_of_band_init(
+            client_config.transport,
+            self.config.get_max_payload_size(),
             remote,
             None,
-            Instant::now(),
-            None,
-            config.transport,
+            local_init,
+            remote_init,
+        )
+        .map_err(|err| {
+            ConnectError::OutOfBandInitError(format!(
+                "Failed to create out-of-band init association: {err}"
+            ))
+        })?;
+
+        let id = self.associations.insert(AssociationMeta {
+            init_cid: remote_aid,
+            cids_issued: 0,
+            loc_cids: iter::once((0, local_aid)).collect(),
+            initial_remote: remote,
+        });
+
+        let ch = AssociationHandle(id);
+        if self.association_ids.insert(local_aid, ch).is_some() {
+            // Ensure we don't collide with an existing association ID when using out-of-band INIT
+            return Err(ConnectError::OutOfBandInitError(format!(
+                "Out-of-band init collision: local_aid {:#x} already in use",
+                local_aid
+            )));
+        }
+
+        debug!(
+            "Created out-of-band init association: local_aid={:#x} remote_aid={:#x}",
+            local_aid, remote_aid
         );
+
         Ok((ch, conn))
     }
 
@@ -258,6 +336,10 @@ impl Endpoint {
             Some(server_config),
             transport_config,
         );
+
+        // Map the peer's INIT Initiate Tag so that retransmitted INITs (which use
+        // verification_tag=0) can be routed to the association created for the first INIT.
+        self.association_ids_init.insert(remote_aid, ch);
 
         conn.handle_event(AssociationEvent(AssociationEventInner::Datagram(
             Transmit {
@@ -395,4 +477,7 @@ pub enum ConnectError {
     /// Use `Endpoint::connect_with` to specify a client configuration.
     #[error("no default client config")]
     NoDefaultClientConfig,
+    /// Out-of-band init setup error.
+    #[error("out-of-band init error: {0}")]
+    OutOfBandInitError(String),
 }

@@ -1,4 +1,8 @@
+use rand::random;
+use std::num::NonZeroU32;
+
 use super::{chunk_header::*, chunk_type::*, *};
+use crate::config::INITIAL_RECV_BUF_SIZE;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
 use crate::param::{param_header::*, *};
 use crate::util::get_padding_size;
@@ -60,7 +64,7 @@ use crate::util::get_padding_size;
 ///Unrecognized Parameter              Optional    8
 ///Reserved for ECN Capable (Note 2)   Optional    32768 (0x8000)
 ///Host Name IP (Note 3)          Optional    11<Paste>
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct ChunkInit {
     pub(crate) is_ack: bool,
     pub(crate) initiate_tag: u32,
@@ -69,6 +73,20 @@ pub(crate) struct ChunkInit {
     pub(crate) num_inbound_streams: u16,
     pub(crate) initial_tsn: u32,
     pub(crate) params: Vec<Box<dyn Param + Send + Sync>>,
+}
+
+impl Default for ChunkInit {
+    fn default() -> Self {
+        ChunkInit {
+            is_ack: false,
+            initiate_tag: random::<NonZeroU32>().get(),
+            advertised_receiver_window_credit: INITIAL_RECV_BUF_SIZE,
+            num_outbound_streams: u16::MAX,
+            num_inbound_streams: u16::MAX,
+            initial_tsn: random::<NonZeroU32>().get(),
+            params: vec![],
+        }
+    }
 }
 
 pub(crate) type ChunkInitAck = ChunkInit;
