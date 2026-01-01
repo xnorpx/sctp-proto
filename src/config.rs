@@ -1,7 +1,9 @@
+use crate::chunk::{chunk_init::ChunkInit, Chunk};
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
 
+use bytes::Bytes;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// MTU for inbound packet (from DTLS)
 pub(crate) const RECEIVE_MTU: usize = 8192;
@@ -22,7 +24,6 @@ const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 
 /// Config collects the arguments to create_association construction into
 /// a single structure
-#[derive(Debug)]
 pub struct TransportConfig {
     max_receive_buffer_size: u32,
     max_message_size: u32,
@@ -50,6 +51,29 @@ pub struct TransportConfig {
     /// Maximum retransmission timeout in milliseconds.
     /// Default: 60000
     rto_max_ms: u64,
+
+    /// Cached INIT chunk - generated once at construction time.
+    /// This ensures that `marshalled_chunk_init()` and `chunk_init()` return
+    /// the same INIT chunk with consistent initiate_tag and initial_tsn values,
+    /// which is critical for out-of-band signaling flows.
+    cached_chunk_init: OnceLock<ChunkInit>,
+}
+
+impl fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("max_receive_buffer_size", &self.max_receive_buffer_size)
+            .field("max_message_size", &self.max_message_size)
+            .field("max_num_outbound_streams", &self.max_num_outbound_streams)
+            .field("max_num_inbound_streams", &self.max_num_inbound_streams)
+            .field("max_init_retransmits", &self.max_init_retransmits)
+            .field("max_data_retransmits", &self.max_data_retransmits)
+            .field("rto_initial_ms", &self.rto_initial_ms)
+            .field("rto_min_ms", &self.rto_min_ms)
+            .field("rto_max_ms", &self.rto_max_ms)
+            .field("cached_chunk_init", &self.cached_chunk_init.get())
+            .finish()
+    }
 }
 
 impl Default for TransportConfig {
@@ -64,6 +88,7 @@ impl Default for TransportConfig {
             rto_initial_ms: RTO_INITIAL,
             rto_min_ms: RTO_MIN,
             rto_max_ms: RTO_MAX,
+            cached_chunk_init: OnceLock::new(),
         }
     }
 }
@@ -87,6 +112,38 @@ impl TransportConfig {
     pub fn with_max_num_inbound_streams(mut self, value: u16) -> Self {
         self.max_num_inbound_streams = value;
         self
+    }
+
+    /// Returns the marshalled INIT chunk bytes for out-of-band signaling.
+    ///
+    /// This method returns the cached INIT chunk, ensuring that the same
+    /// initiate_tag and initial_tsn values are used consistently. This is
+    /// critical for out-of-band signaling where the INIT bytes exchanged
+    /// via signaling must match what the association actually uses.
+    pub fn marshalled_chunk_init(&self) -> Result<Bytes, crate::error::Error> {
+        let chunk = self.chunk_init();
+        chunk.marshal()
+    }
+
+    /// Returns a clone of the cached INIT chunk.
+    ///
+    /// The INIT chunk is generated once (lazily on first access) and cached,
+    /// ensuring consistent initiate_tag and initial_tsn values across all
+    /// calls. This is essential for out-of-band signaling flows where the
+    /// same INIT must be used both for signaling and association creation.
+    pub(crate) fn chunk_init(&self) -> ChunkInit {
+        self.cached_chunk_init
+            .get_or_init(|| {
+                let mut chunk_init = ChunkInit {
+                    num_outbound_streams: self.max_num_outbound_streams,
+                    num_inbound_streams: self.max_num_inbound_streams,
+                    advertised_receiver_window_credit: self.max_receive_buffer_size,
+                    ..Default::default()
+                };
+                chunk_init.set_supported_extensions();
+                chunk_init
+            })
+            .clone()
     }
 
     pub(crate) fn max_receive_buffer_size(&self) -> u32 {
@@ -272,12 +329,19 @@ impl ServerConfig {
 pub struct ClientConfig {
     /// Transport configuration to use
     pub transport: Arc<TransportConfig>,
+    /// Optional remote chunk init.
+    ///
+    /// When provided, the association can skip the usual SCTP 4-way handshake and
+    /// immediately transition to the ESTABLISHED state.
+    ///
+    pub remote_chunk_init: Option<Bytes>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
             transport: Arc::new(TransportConfig::default()),
+            remote_chunk_init: None,
         }
     }
 }
@@ -286,5 +350,15 @@ impl ClientConfig {
     /// Create a default config with a particular cryptographic config
     pub fn new() -> Self {
         ClientConfig::default()
+    }
+
+    /// Configure remote chunk init parameters.
+    ///
+    /// When enabled, both the local and remote INIT chunks must be provided
+    /// (typically exchanged via a signaling channel). The association can skip
+    /// the SCTP 4-way handshake and immediately transition to the ESTABLISHED state.
+    pub fn with_remote_chunk_init(mut self, remote_chunk_init: Bytes) -> Self {
+        self.remote_chunk_init = Some(remote_chunk_init);
+        self
     }
 }

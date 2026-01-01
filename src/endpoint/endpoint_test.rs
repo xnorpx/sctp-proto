@@ -27,7 +27,8 @@ use std::net::Ipv6Addr;
 use std::ops::RangeFrom;
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::{cmp, mem, net::UdpSocket, time::Duration};
+use std::time::{Duration, Instant};
+use std::{cmp, mem, net::UdpSocket};
 
 lazy_static! {
     pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
@@ -305,13 +306,17 @@ impl Pair {
         }
     }
 
-    pub fn connect(&mut self) -> (AssociationHandle, AssociationHandle) {
-        self.connect_with(client_config())
+    pub fn connect(&mut self, now: Instant) -> (AssociationHandle, AssociationHandle) {
+        self.connect_with(client_config(), now)
     }
 
-    pub fn connect_with(&mut self, config: ClientConfig) -> (AssociationHandle, AssociationHandle) {
+    pub fn connect_with(
+        &mut self,
+        config: ClientConfig,
+        now: Instant,
+    ) -> (AssociationHandle, AssociationHandle) {
         info!("connecting");
-        let client_ch = self.begin_connect(config);
+        let client_ch = self.begin_connect(config, now);
         self.drive();
         let server_ch = self.server.assert_accept();
         self.finish_connect(client_ch, server_ch);
@@ -319,8 +324,8 @@ impl Pair {
     }
 
     /// Just start connecting the client
-    pub fn begin_connect(&mut self, config: ClientConfig) -> AssociationHandle {
-        let (client_ch, client_conn) = self.client.connect(config, self.server.addr).unwrap();
+    pub fn begin_connect(&mut self, config: ClientConfig, now: Instant) -> AssociationHandle {
+        let (client_ch, client_conn) = self.client.connect(config, self.server.addr, now).unwrap();
         self.client.associations.insert(client_ch, client_conn);
         client_ch
     }
@@ -363,6 +368,7 @@ impl Default for Pair {
 fn create_association_pair(
     ack_mode: AckMode,
     recv_buf_size: u32,
+    now: Instant,
 ) -> Result<(Pair, AssociationHandle, AssociationHandle)> {
     let mut pair = Pair::new(
         Arc::new(EndpointConfig::default()),
@@ -375,13 +381,17 @@ fn create_association_pair(
             ..Default::default()
         },
     );
-    let (client_ch, server_ch) = pair.connect_with(ClientConfig {
-        transport: Arc::new(if recv_buf_size > 0 {
-            TransportConfig::default().with_max_receive_buffer_size(recv_buf_size)
-        } else {
-            TransportConfig::default()
-        }),
-    });
+    let (client_ch, server_ch) = pair.connect_with(
+        ClientConfig {
+            transport: Arc::new(if recv_buf_size > 0 {
+                TransportConfig::default().with_max_receive_buffer_size(recv_buf_size)
+            } else {
+                TransportConfig::default()
+            }),
+            remote_chunk_init: None,
+        },
+        now,
+    );
     pair.client_conn_mut(client_ch).ack_mode = ack_mode;
     pair.server_conn_mut(server_ch).ack_mode = ack_mode;
     Ok((pair, client_ch, server_ch))
@@ -464,7 +474,8 @@ fn test_assoc_reliable_simple() -> Result<()> {
     let si: u16 = 1;
     let msg: Bytes = Bytes::from_static(b"ABC");
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -519,7 +530,8 @@ fn test_assoc_reliable_ordered_reordered() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -603,7 +615,8 @@ fn test_assoc_reliable_ordered_fragmented_then_defragmented() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -665,7 +678,8 @@ fn test_assoc_reliable_unordered_fragmented_then_defragmented() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -723,7 +737,8 @@ fn test_assoc_reliable_unordered_ordered() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -807,7 +822,8 @@ fn test_assoc_reliable_retransmission() -> Result<()> {
     let msg1: Bytes = Bytes::from_static(b"ABC");
     let msg2: Bytes = Bytes::from_static(b"DEFG");
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     {
         let a = pair.client_conn_mut(client_ch);
@@ -871,7 +887,8 @@ fn test_assoc_reliable_short_buffer() -> Result<()> {
     let si: u16 = 1;
     let msg: Bytes = Bytes::from_static(b"Hello");
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -933,7 +950,8 @@ fn test_assoc_unreliable_rexmit_ordered_no_fragment() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1008,7 +1026,8 @@ fn test_assoc_unreliable_rexmit_ordered_fragment() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1087,7 +1106,8 @@ fn test_assoc_unreliable_rexmit_unordered_no_fragment() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1161,7 +1181,8 @@ fn test_assoc_unreliable_rexmit_unordered_fragment() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1243,7 +1264,8 @@ fn test_assoc_unreliable_rexmit_timed_ordered() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1317,7 +1339,8 @@ fn test_assoc_unreliable_rexmit_timed_unordered() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1410,7 +1433,7 @@ fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         sbuf[i] = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::Normal, 0)?;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::Normal, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1502,7 +1525,7 @@ fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
     }
 
     let (mut pair, client_ch, server_ch) =
-        create_association_pair(AckMode::Normal, max_receive_buffer_size)?;
+        create_association_pair(AckMode::Normal, max_receive_buffer_size, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1630,7 +1653,7 @@ fn test_assoc_congestion_control_slow_reader() -> Result<()> {
     }
 
     let (mut pair, client_ch, server_ch) =
-        create_association_pair(AckMode::Normal, max_receive_buffer_size)?;
+        create_association_pair(AckMode::Normal, max_receive_buffer_size, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1736,7 +1759,8 @@ fn test_assoc_delayed_ack() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::AlwaysDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::AlwaysDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1822,7 +1846,8 @@ fn test_assoc_reset_close_one_way() -> Result<()> {
     let si: u16 = 1;
     let msg: Bytes = Bytes::from_static(b"ABC");
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1881,7 +1906,8 @@ fn test_assoc_reset_close_both_ways() -> Result<()> {
     let si: u16 = 1;
     let msg: Bytes = Bytes::from_static(b"ABC");
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -1964,7 +1990,8 @@ fn test_assoc_abort() -> Result<()> {
 
     let si: u16 = 1;
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::NoDelay, 0, Instant::now())?;
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -2216,7 +2243,8 @@ fn test_old_rtx_on_regular_acks() -> Result<()> {
         *b = (i & 0xff) as u8;
     }
 
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::Normal, 0)?;
+    let (mut pair, client_ch, server_ch) =
+        create_association_pair(AckMode::Normal, 0, Instant::now())?;
     pair.latency = Duration::from_millis(500);
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
@@ -2601,3 +2629,400 @@ fn test_association_shutdown_during_write() -> Result<()> {
 
     Ok(())
 }*/
+
+#[test]
+fn test_out_of_band_connect_established_and_transmit_uses_peer_verification_tag() {
+    let now = Instant::now();
+
+    let remote_transport = TransportConfig::default();
+    let remote_chunk_init = remote_transport
+        .marshalled_chunk_init()
+        .expect("remote marshalled_chunk_init");
+    let remote_init =
+        ChunkInit::unmarshal(&remote_chunk_init).expect("unmarshal remote INIT chunk");
+
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let client_config = ClientConfig::new().with_remote_chunk_init(remote_chunk_init);
+    let (_ch, mut assoc) = endpoint
+        .connect(client_config, remote_addr, now)
+        .expect("out-of-band connect should succeed");
+
+    assert_eq!(assoc.state(), AssociationState::Established);
+    assert_matches!(assoc.poll(), Some(Event::Connected));
+
+    // Ensure outbound packets use the peer's initiate_tag as the verification tag.
+    let mut stream = assoc
+        .open_stream(1, PayloadProtocolIdentifier::Binary)
+        .expect("open stream");
+    let msg = Bytes::from_static(b"hello");
+    stream
+        .write_sctp(&msg, PayloadProtocolIdentifier::Binary)
+        .expect("write_sctp");
+
+    let transmit = assoc
+        .poll_transmit(now)
+        .expect("expected at least one outbound datagram");
+    let Payload::RawEncode(datagrams) = transmit.payload else {
+        panic!("expected RawEncode transmit");
+    };
+    assert!(
+        !datagrams.is_empty(),
+        "expected at least one outbound packet"
+    );
+
+    let pkt = Packet::unmarshal(&datagrams[0]).expect("unmarshal outbound packet");
+    assert_eq!(
+        pkt.common_header.verification_tag, remote_init.initiate_tag,
+        "outbound packet should use peer initiate_tag as verification_tag"
+    );
+}
+
+#[test]
+fn test_server_retransmitted_init_routes_to_existing_association() {
+    let now = Instant::now();
+
+    let mut endpoint = Endpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(Arc::new(ServerConfig::default())),
+    );
+
+    let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let init_tag: u32 = 0x1122_3344;
+
+    let init = ChunkInit {
+        is_ack: false,
+        initiate_tag: init_tag,
+        ..Default::default()
+    };
+
+    let pkt = Packet {
+        common_header: CommonHeader {
+            source_port: 5000,
+            destination_port: 5000,
+            verification_tag: 0,
+        },
+        chunks: vec![Box::new(init)],
+    };
+
+    let bytes = pkt.marshal().expect("marshal INIT packet");
+
+    let (ch1, ev1) = endpoint
+        .handle(now, remote, None, None, bytes.clone())
+        .expect("first INIT should be handled");
+    assert!(
+        matches!(ev1, DatagramEvent::NewAssociation(_)),
+        "first INIT should create a new association"
+    );
+
+    // Same INIT retransmitted: should route to the same association handle.
+    let (ch2, ev2) = endpoint
+        .handle(now, remote, None, None, bytes)
+        .expect("retransmitted INIT should be handled");
+    assert_eq!(
+        ch2, ch1,
+        "retransmitted INIT should map to same association"
+    );
+    assert!(
+        matches!(ev2, DatagramEvent::AssociationEvent(_)),
+        "retransmitted INIT should be routed to existing association"
+    );
+}
+
+#[test]
+fn test_out_of_band_connect_rejects_invalid_remote_bytes() {
+    let now = Instant::now();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let client_config = ClientConfig::new().with_remote_chunk_init(Bytes::from_static(b"nope"));
+    let res = endpoint.connect(client_config, remote_addr, now);
+    assert!(
+        matches!(res, Err(ConnectError::OutOfBandInitError(_))),
+        "invalid remote bytes should fail with OutOfBandInitError"
+    );
+}
+
+#[test]
+fn test_out_of_band_connect_rejects_remote_init_ack() {
+    let now = Instant::now();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init_ack = ChunkInit {
+        is_ack: true,
+        ..Default::default()
+    };
+    let remote_bytes = remote_init_ack.marshal().expect("marshal remote INIT-ACK");
+
+    let client_config = ClientConfig::new().with_remote_chunk_init(remote_bytes);
+    let res = endpoint.connect(client_config, remote_addr, now);
+    assert!(
+        matches!(res, Err(ConnectError::OutOfBandInitError(_))),
+        "remote INIT-ACK should be rejected"
+    );
+}
+
+#[test]
+fn test_out_of_band_connect_rejects_remote_init_with_zero_initiate_tag() {
+    let now = Instant::now();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0,
+        ..Default::default()
+    };
+    let remote_bytes = remote_init.marshal().expect("marshal remote INIT");
+
+    let client_config = ClientConfig::new().with_remote_chunk_init(remote_bytes);
+    let res = endpoint.connect(client_config, remote_addr, now);
+    assert!(
+        matches!(res, Err(ConnectError::OutOfBandInitError(_))),
+        "remote INIT with initiate_tag=0 should be rejected"
+    );
+}
+
+#[test]
+fn test_out_of_band_connect_rejects_local_aid_collision_with_cached_init() {
+    let now = Instant::now();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    // Reuse the same transport config for both connects. Because TransportConfig caches the local
+    // INIT chunk, both connects will attempt to reuse the same local initiate_tag.
+    let shared_transport = Arc::new(TransportConfig::default());
+
+    // First remote
+    let remote1 = Arc::new(TransportConfig::default());
+    let remote_bytes_1 = remote1
+        .marshalled_chunk_init()
+        .expect("marshal remote init 1");
+    let cfg1 = ClientConfig {
+        transport: Arc::clone(&shared_transport),
+        remote_chunk_init: Some(remote_bytes_1),
+    };
+    let res1 = endpoint.connect(cfg1, remote_addr, now);
+    assert!(res1.is_ok(), "first out-of-band connect should succeed");
+
+    // Second remote: different remote init, same local cached init => should collide.
+    let remote2 = Arc::new(TransportConfig::default());
+    let remote_bytes_2 = remote2
+        .marshalled_chunk_init()
+        .expect("marshal remote init 2");
+    let cfg2 = ClientConfig {
+        transport: Arc::clone(&shared_transport),
+        remote_chunk_init: Some(remote_bytes_2),
+    };
+    let res2 = endpoint.connect(cfg2, remote_addr, now);
+    assert!(
+        matches!(res2, Err(ConnectError::OutOfBandInitError(_))),
+        "second out-of-band connect should fail due to local_aid collision"
+    );
+}
+
+// TODO: Out-of-band init Endpoint Tests - commented out until generate_out_of_band_init
+// and OutOfBandInitConfig are implemented in crate::config
+/*
+mod out_of_band_init_endpoint_tests {
+    use super::*;
+    use crate::config::{generate_out_of_band_init, OutOfBandInitConfig};
+
+    #[test]
+    fn test_endpoint_connect_with_out_of_band_init() {
+        // Create endpoints
+        let client_config = Arc::new(EndpointConfig::new());
+        let server_config = Arc::new(EndpointConfig::new());
+
+        let mut client_endpoint = Endpoint::new(client_config, None);
+        let _server_endpoint =
+            Endpoint::new(server_config, Some(Arc::new(ServerConfig::default())));
+
+        // Generate INIT chunks for out-of-band init
+        let transport_config = TransportConfig::default();
+        let local_init = generate_out_of_band_init(&transport_config).unwrap();
+        let remote_init = generate_out_of_band_init(&transport_config).unwrap();
+
+        // Create out-of-band init config
+        let oob = OutOfBandInitConfig::new(local_init, remote_init);
+
+        // Create client config with out-of-band init
+        let client_config = ClientConfig::new().with_out_of_band_init(oob);
+
+        let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+        // Connect with out-of-band init
+        let result = client_endpoint.connect(client_config, remote_addr, Instant::now());
+        assert!(
+            result.is_ok(),
+            "Should successfully create out-of-band init connection: {:?}",
+            result.err()
+        );
+
+        let (_handle, mut assoc) = result.unwrap();
+
+        // Verify the association is immediately in ESTABLISHED state
+        assert_eq!(
+            assoc.state(),
+            AssociationState::Established,
+            "Out-of-band init association should be established immediately"
+        );
+
+        // Should have a Connected event
+        let event = assoc.poll();
+        assert!(
+            matches!(event, Some(Event::Connected)),
+            "Should have Connected event"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_connect_with_out_of_band_init_invalid_local_init() {
+        let client_config = Arc::new(EndpointConfig::new());
+        let mut client_endpoint = Endpoint::new(client_config, None);
+
+        // Use invalid INIT bytes
+        let oob = OutOfBandInitConfig::new(
+            Bytes::from_static(b"invalid init data"),
+            generate_out_of_band_init(&TransportConfig::default()).unwrap(),
+        );
+
+        let client_config = ClientConfig::new().with_out_of_band_init(oob);
+        let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+        let result = client_endpoint.connect(client_config, remote_addr, Instant::now());
+        assert!(
+            matches!(result, Err(ConnectError::OutOfBandInitError(_))),
+            "Should fail with OutOfBandInitError for invalid local INIT: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_endpoint_connect_with_out_of_band_init_invalid_remote_init() {
+        let client_config = Arc::new(EndpointConfig::new());
+        let mut client_endpoint = Endpoint::new(client_config, None);
+
+        // Use invalid INIT bytes
+        let oob = OutOfBandInitConfig::new(
+            generate_out_of_band_init(&TransportConfig::default()).unwrap(),
+            Bytes::from_static(b"invalid init data"),
+        );
+
+        let client_config = ClientConfig::new().with_out_of_band_init(oob);
+        let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+        let result = client_endpoint.connect(client_config, remote_addr, Instant::now());
+        assert!(
+            matches!(result, Err(ConnectError::OutOfBandInitError(_))),
+            "Should fail with OutOfBandInitError for invalid remote INIT: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_endpoint_out_of_band_init_bidirectional() {
+        // Test that two endpoints can establish out-of-band init associations with each other
+        let endpoint_config = Arc::new(EndpointConfig::new());
+        let transport_config = TransportConfig::default();
+
+        let mut endpoint_a = Endpoint::new(endpoint_config.clone(), None);
+        let mut endpoint_b = Endpoint::new(endpoint_config, None);
+
+        // Generate INIT chunks (simulating signaling exchange)
+        let init_a = generate_out_of_band_init(&transport_config).unwrap();
+        let init_b = generate_out_of_band_init(&transport_config).unwrap();
+
+        let addr_a: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+        let addr_b: SocketAddr = "192.168.1.2:5000".parse().unwrap();
+
+        // Endpoint A connects with out-of-band init (local=A, remote=B)
+        let config_a = ClientConfig::new()
+            .with_out_of_band_init(OutOfBandInitConfig::new(init_a.clone(), init_b.clone()));
+        let result_a = endpoint_a.connect(config_a, addr_b, Instant::now());
+        assert!(result_a.is_ok());
+        let (_, assoc_a) = result_a.unwrap();
+
+        // Endpoint B connects with out-of-band init (local=B, remote=A)
+        let config_b = ClientConfig::new()
+            .with_out_of_band_init(OutOfBandInitConfig::new(init_b.clone(), init_a.clone()));
+        let result_b = endpoint_b.connect(config_b, addr_a, Instant::now());
+        assert!(result_b.is_ok());
+        let (_, assoc_b) = result_b.unwrap();
+
+        // Both should be ESTABLISHED
+        assert_eq!(assoc_a.state(), AssociationState::Established);
+        assert_eq!(assoc_b.state(), AssociationState::Established);
+
+        // Both associations are valid and ready for data transfer
+        // The verification tag matching is validated by the association-level tests
+    }
+
+    #[test]
+    fn test_endpoint_normal_connect_still_works() {
+        // Ensure normal (handshake-based) connect still works
+        let endpoint_config = Arc::new(EndpointConfig::new());
+        let mut endpoint = Endpoint::new(endpoint_config, None);
+
+        // Use default ClientConfig (no out-of-band init)
+        let client_config = ClientConfig::default();
+        let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+        let result = endpoint.connect(client_config, remote_addr, Instant::now());
+        assert!(result.is_ok());
+
+        let (_, assoc) = result.unwrap();
+
+        // Should NOT be in ESTABLISHED state (needs handshake)
+        assert_ne!(
+            assoc.state(),
+            AssociationState::Established,
+            "Normal connect should need handshake"
+        );
+        assert_eq!(
+            assoc.state(),
+            AssociationState::CookieWait,
+            "Normal connect should be in CookieWait"
+        );
+    }
+
+    #[test]
+    fn test_out_of_band_init_with_different_transport_configs() {
+        // Test out-of-band init with different transport configurations on each side
+        let endpoint_config = Arc::new(EndpointConfig::new());
+        let mut endpoint = Endpoint::new(endpoint_config, None);
+
+        // Local has larger buffer
+        let local_transport = TransportConfig::default()
+            .with_max_receive_buffer_size(2_000_000)
+            .with_max_num_outbound_streams(100);
+
+        // Remote has smaller buffer
+        let remote_transport = TransportConfig::default()
+            .with_max_receive_buffer_size(500_000)
+            .with_max_num_inbound_streams(50);
+
+        let local_init = generate_out_of_band_init(&local_transport).unwrap();
+        let remote_init = generate_out_of_band_init(&remote_transport).unwrap();
+
+        let oob = OutOfBandInitConfig::new(local_init, remote_init);
+        let client_config = ClientConfig {
+            transport: Arc::new(local_transport),
+            remote_chunk_init: Some(oob),
+        };
+
+        let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+        let result = endpoint.connect(client_config, remote_addr, Instant::now());
+        assert!(result.is_ok());
+
+        let (_, assoc) = result.unwrap();
+
+        // Association is established and stream negotiation was performed
+        // The stream count details are validated by association-level tests
+        assert_eq!(assoc.state(), AssociationState::Established);
+    }
+}
+*/

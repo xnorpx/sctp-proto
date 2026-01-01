@@ -38,6 +38,7 @@ use rand::random;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +51,8 @@ mod timer;
 
 #[cfg(test)]
 mod association_test;
+
+const DEFAULT_SCTPSRC_DST_PORT: u16 = 5000;
 
 /// Reasons why an association might be lost
 #[derive(Debug, Error, Eq, Clone, PartialEq)]
@@ -291,35 +294,25 @@ impl Default for Association {
 }
 
 impl Association {
-    pub(crate) fn new(
-        server_config: Option<Arc<ServerConfig>>,
+    fn new_common(
         config: Arc<TransportConfig>,
         max_payload_size: u32,
-        local_aid: AssociationId,
         remote_addr: SocketAddr,
         local_ip: Option<IpAddr>,
-        now: Instant,
+        side: Side,
+        verification_tag: u32,
+        initial_tsn: u32,
     ) -> Self {
-        let side = if server_config.is_some() {
-            Side::Server
-        } else {
-            Side::Client
-        };
-
         // It's a bit strange, but we're going backwards from the calculation in
         // config.rs to get max_payload_size from INITIAL_MTU.
         let mtu = max_payload_size + COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE;
 
-        // RFC 4690 Sec 7.2.1
+        // RFC 4960 Sec 7.2.1
         // The initial cwnd before DATA transmission or after a sufficiently
         // long idle period MUST be set to min(4*MTU, max (2*MTU, 4380bytes)).
         let cwnd = (2 * mtu).clamp(4380, 4 * mtu);
-        let mut tsn = random::<u32>();
-        if tsn == 0 {
-            tsn += 1;
-        }
 
-        let mut this = Association {
+        Association {
             side,
             handshake_completed: false,
             max_receive_buffer_size: config.max_receive_buffer_size(),
@@ -344,16 +337,44 @@ impl Association {
             remote_addr,
             local_ip,
 
-            my_verification_tag: local_aid,
-            my_next_tsn: tsn,
-            my_next_rsn: tsn,
-            min_tsn2measure_rtt: tsn,
-            cumulative_tsn_ack_point: tsn - 1,
-            advanced_peer_tsn_ack_point: tsn - 1,
+            my_verification_tag: verification_tag,
+            my_next_tsn: initial_tsn,
+            my_next_rsn: initial_tsn,
+            min_tsn2measure_rtt: initial_tsn,
+            cumulative_tsn_ack_point: initial_tsn.wrapping_sub(1),
+            advanced_peer_tsn_ack_point: initial_tsn.wrapping_sub(1),
             error: None,
 
             ..Default::default()
+        }
+    }
+
+    pub(crate) fn new(
+        server_config: Option<Arc<ServerConfig>>,
+        config: Arc<TransportConfig>,
+        max_payload_size: u32,
+        local_aid: AssociationId,
+        remote_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        now: Instant,
+    ) -> Self {
+        let side = if server_config.is_some() {
+            Side::Server
+        } else {
+            Side::Client
         };
+
+        let tsn = random::<NonZeroU32>().get();
+
+        let mut this = Self::new_common(
+            config,
+            max_payload_size,
+            remote_addr,
+            local_ip,
+            side,
+            local_aid,
+            tsn,
+        );
 
         if side.is_client() {
             let mut init = ChunkInit {
@@ -374,6 +395,121 @@ impl Association {
         }
 
         this
+    }
+
+    /// Creates a new association using out-of-band INIT chunks.
+    ///
+    /// This allows skipping the SCTP 4-way handshake by exchanging INIT chunks
+    /// out-of-band (e.g., via a signaling channel). The association immediately
+    /// transitions to the ESTABLISHED state.
+    ///
+    /// # Arguments
+    /// * `config` - Transport configuration
+    /// * `max_payload_size` - Maximum payload size
+    /// * `remote_addr` - Remote socket address
+    /// * `local_ip` - Optional local IP address
+    /// * `local_init` - Parsed local INIT chunk
+    /// * `remote_init` - Parsed remote INIT chunk
+    ///
+    /// # Returns
+    /// A new association in the ESTABLISHED state, or an error if the INIT
+    /// chunks are invalid.
+    pub(crate) fn new_with_out_of_band_init(
+        config: Arc<TransportConfig>,
+        max_payload_size: u32,
+        remote_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        local_init: ChunkInit,
+        remote_init: ChunkInit,
+    ) -> Result<Self> {
+        let side = Side::Client;
+
+        // Use the TSN from our local INIT chunk
+        let tsn = local_init.initial_tsn;
+
+        let mut this = Self::new_common(
+            config,
+            max_payload_size,
+            remote_addr,
+            local_ip,
+            side,
+            local_init.initiate_tag,
+            tsn,
+        );
+
+        // Negotiate parameters
+        this.my_max_num_inbound_streams = std::cmp::min(
+            local_init.num_inbound_streams,
+            remote_init.num_outbound_streams,
+        );
+        this.my_max_num_outbound_streams = std::cmp::min(
+            local_init.num_outbound_streams,
+            remote_init.num_inbound_streams,
+        );
+
+        // Set the rwnd to the remote's advertised receiver window credit
+        this.rwnd = remote_init.advertised_receiver_window_credit;
+
+        // 13.2 This is the last TSN received in sequence.  This value
+        // is set initially by taking the peer's initial TSN,
+        // received in the INIT or INIT ACK chunk, and
+        // subtracting one from it.
+        this.peer_last_tsn = if remote_init.initial_tsn == 0 {
+            u32::MAX
+        } else {
+            remote_init.initial_tsn - 1
+        };
+
+        // Use remote's initiate tag as peer_verification_tag
+        this.peer_verification_tag = remote_init.initiate_tag;
+
+        // Use default SCTP ports
+        this.source_port = DEFAULT_SCTPSRC_DST_PORT;
+        this.destination_port = DEFAULT_SCTPSRC_DST_PORT;
+        this.handshake_completed = true;
+
+        // Note: PayloadQueue uses cumulative_tsn directly in its operations,
+        // so no initialization is needed. peer_last_tsn is already set above.
+
+        // Check for supported extensions in remote INIT
+        for param in &remote_init.params {
+            if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
+                for t in &v.chunk_types {
+                    if *t == CT_FORWARD_TSN {
+                        debug!("[{}] use ForwardTSN (out-of-band init)", this.side);
+                        this.use_forward_tsn = true;
+                    }
+                }
+            }
+        }
+        if !this.use_forward_tsn {
+            warn!("[{}] not using ForwardTSN (out-of-band init)", this.side);
+        }
+
+        // RFC 4960 Sec 7.2.1
+        //  o  The initial value of ssthresh MAY be arbitrarily high (for
+        //     example, implementations MAY use the size of the receiver
+        //     advertised window).
+        this.ssthresh = this.rwnd;
+
+        trace!(
+            "[{}] out-of-band init: cwnd={} ssthresh={} rwnd={}",
+            this.side,
+            this.cwnd,
+            this.ssthresh,
+            this.rwnd
+        );
+
+        // Set state to ESTABLISHED - out-of-band init skips the handshake
+        this.set_state(AssociationState::Established);
+        this.events.push_back(Event::Connected);
+
+        debug!(
+            "[{}] out-of-band init association established: my_tag={:#x} peer_tag={:#x} tsn={}",
+            this.side, this.my_verification_tag, this.peer_verification_tag, this.my_next_tsn
+        );
+
+        Ok(this)
     }
 
     /// Returns application-facing event
@@ -740,8 +876,8 @@ impl Association {
         if let Some(stored_init) = &self.stored_init {
             debug!("[{}] sending INIT", self.side);
 
-            self.source_port = 5000; // Spec??
-            self.destination_port = 5000; // Spec??
+            self.source_port = DEFAULT_SCTPSRC_DST_PORT; // Spec??
+            self.destination_port = DEFAULT_SCTPSRC_DST_PORT; // Spec??
 
             let outbound = Packet {
                 common_header: CommonHeader {
